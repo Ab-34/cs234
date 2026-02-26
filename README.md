@@ -2,7 +2,7 @@
 
 Installation:
 ```python
-git clone
+git clone https://github.com/Ab-34/cs234.git
 cd cs234
 conda create -n "cs234" python=3.10
 conda activate cs234
