@@ -1,0 +1,18 @@
+# Requirements for RLDPO with Robomimic
+
+# Core dependencies
+numpy>=1.21.0
+torch==2.9.1
+h5py>=3.15.1
+gymnasium==1.2.2
+
+# Robomimic and Robosuite
+robosuite==1.5.1
+
+# Visualization
+matplotlib>=3.5.0
+
+# Optional but recommended
+tqdm>=4.65.0
+wandb>=0.15.0  # For experiment tracking
+
