@@ -23,16 +23,16 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 
 parser = argparse.ArgumentParser(description="A simple script using argparse.")
-parser.add_argument("--policy", type=str, help="MlpPolicy, CnnPolicy")
-parser.add_argument("--timestep", type=int, help="Number of timesteps")
-parser.add_argument("--save_path", type=str, help="Path to save files")
+parser.add_argument("--policy", type=str, help="MlpPolicy, CnnPolicy", default="MlpPolicy")
+parser.add_argument("--timestep", type=int, help="Number of timesteps", default= 500000)
+parser.add_argument("--save_path", type=str, help="Path to save files", default = "./")
 parser.add_argument('--full_loss', action='store_true', help='Enable verbose mode')
 
 args = parser.parse_args()
 
 
 env = RobomimicEnvWrapper(
-    env_name="Lift",
+    env_name="Lift", # "square", "transport"
     robots="Panda",
     use_camera_obs=False,
     render_mode="rgb_array",
