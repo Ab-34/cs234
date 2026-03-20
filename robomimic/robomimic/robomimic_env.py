@@ -123,6 +123,7 @@ class RobomimicEnvWrapper(gym.Env):
     
     def compute_dense_reward_from_info(self, info: dict) -> float:
         """
+        Dense rewasrd based on simple heuristics
         Computes dense reward (retained for fallback/logging, but not used for selection).
         """
         if "robot0_eef_pos" in info:
@@ -160,6 +161,137 @@ class RobomimicEnvWrapper(gym.Env):
             dense_reward = (weight * r_reach_distance) + (10*weight * (cube_height-self.table_height))
         
         return float(dense_reward)
+    
+    def compute_dense_reward_from_info_cirriculum(self, info: dict) -> float:
+        """
+        Staged reward function with gating:
+        Phase 1 — Move EEF above cube (XY + Z hover)
+        Phase 2 — Orient gripper downward
+        Phase 3 — Close gripper (only when positioned)
+        Phase 4 — Lift (only when grasped)
+
+        Each phase's reward is always active but scaled by
+        how well the prior phases are satisfied, creating a
+        natural curriculum without hard if/else branches.
+
+        # compute_dense_reward_from_info_to_test_later
+        # compute_dense_reward_from_info_maybe_working_doesnt_give_good_Results
+
+        #3
+        """
+        if "robot0_eef_pos" not in info:
+            return 0.0
+
+        eef_pos  = np.array(info["robot0_eef_pos"])
+        cube_pos = np.array(info.get("cube_pos", info.get("object", None)))
+        if cube_pos is None:
+            return 0.0
+
+        # ── Phase 1: XY + Z Approach ─────────────────────────────────────────
+        xy_dist = float(np.linalg.norm(eef_pos[:2] - cube_pos[:2]))
+
+        HOVER_HEIGHT = 0.025                      # target height above cube center
+        z_target     = cube_pos[2] + HOVER_HEIGHT
+        z_error      = float(abs(eef_pos[2] - z_target))
+
+        # Smooth exponential shaping — always positive, peak = 0
+        r_xy = float(np.exp(-8.0  * xy_dist))        # 1.0 when perfect, ~0 at 0.3m
+        r_z  = float(np.exp(-15.0 * z_error))        # tight Z tolerance
+
+        approach_score = r_xy * r_z                  # both must be good simultaneously
+
+        # ── Phase 2: Orientation ─────────────────────────────────────────────
+        r_orient = 0.0
+        if "robot0_eef_quat" in info:
+            qx, qy, qz, qw = info["robot0_eef_quat"]
+            # Gripper local -Z axis in world frame
+            eef_z_world = np.array([
+                2*(qx*qz + qy*qw),
+                2*(qy*qz - qx*qw),
+                1 - 2*(qx**2 + qy**2)
+            ])
+            alignment = float(np.dot(eef_z_world, [0., 0., -1.]))  # -1..1
+
+            # Angular error in radians (0 = perfect, π = flipped)
+            # angle_error = float(np.arccos(np.clip(alignment, -1.0, 1.0)))
+            # Sharp exponential: near-zero reward unless nearly vertical
+            # r_orient = float(np.exp(-5.0 * angle_error))   # ~1.0 at 0°, ~0.08 at 50°
+
+
+            r_orient = (alignment + 1.0) / 2.0      # remap to 0..1
+
+        # ── Phase 3: Gripper Close ────────────────────────────────────────────
+        r_grasp = 0.0
+        gripper_closed = False
+        if "robot0_gripper_qpos" in info:
+            # g = float(np.array(info["robot0_gripper_qpos"]).mean())
+            g = float(np.abs(np.array(info["robot0_gripper_qpos"])).mean())
+
+            # print("GRIPPER POS IS , ", g)
+
+            # Normalize: 0 = fully open, 1 = fully closed
+            # Adjust these bounds to match your robot's actual qpos range
+            OPEN_VAL, CLOSE_VAL = 0.04, 0.0
+            gripper_norm = float(np.clip(
+                (OPEN_VAL - g) / (OPEN_VAL - CLOSE_VAL + 1e-6), 0.0, 1.0
+            ))
+            gripper_closed = gripper_norm > 0.7
+            r_proximity_grasp = float(np.exp(-3.0 * xy_dist)) * gripper_norm
+
+
+            # Only reward closing when positioned AND oriented correctly
+            readiness = approach_score * r_orient    # 0..1
+            # r_grasp = r_proximity_grasp + readiness * gripper_norm
+
+            READINESS_THRESHOLD = 0.6  # tune this
+            r_grasp = gripper_norm * (readiness - READINESS_THRESHOLD) / (1.0 - READINESS_THRESHOLD + 1e-6)
+            r_grasp = float(np.clip(r_grasp, -1.0, 1.0))
+
+        # ── Phase 4: Lift ─────────────────────────────────────────────────────
+        r_lift = 0.0
+        if self.table_height is None:
+            # Set once at the very first step (cube should be resting on table)
+            self.table_height = float(cube_pos[2])
+
+        height_above_table = float(cube_pos[2]) - self.table_height
+
+        # if gripper_closed and xy_dist < 0.05:
+        #     # Shaped lift: reward proportional to height, with a bonus plateau
+        #     r_lift = float(np.tanh(10.0 * max(0.0, height_above_table)))
+        #     if height_above_table > 0.05:
+        #         r_lift += 1.0                        # clear lift bonus
+
+
+        # lift_ready = gripper_norm * r_orient * r_xy  # i.e., ready when gripping, oriented, close
+        # r_lift = lift_ready * float(np.tanh(10.0 * max(0.0, height_above_table)))
+        # if height_above_table > 0.05:
+        #     r_lift += 1.0
+
+        # Instead of a strict product gate, use a softer gate:
+        grasp_quality = float(np.clip(gripper_norm * r_xy, 0.0, 1.0))  # simpler 2-factor gate
+
+        lift_height_reward = float(np.tanh(10.0 * max(0.0, height_above_table)))
+        r_lift = grasp_quality * lift_height_reward
+
+        # Keep the plateau bonus, but also add a *shaped* pre-lift bonus
+        # so the robot is incentivized to explore upward movement:
+        if height_above_table > 0.02:   # lower threshold to start rewarding sooner
+            r_lift += 0.5
+        if height_above_table > 0.05:
+            r_lift += 1.0               # full bonus for clear lift
+
+
+
+        # ── Weighted Sum ──────────────────────────────────────────────────────
+        reward = (
+            2.0  * r_xy        +   # always guide toward cube XY
+            1.0  * r_z         +   # guide Z hover
+            10.0  * r_orient    +   # orientation always encouraged
+            6.0  * r_grasp     +   # grasp gated by approach quality
+            5000.0 * r_lift          # lift is the main task signal
+        )
+
+        return float(reward)
 
     def get_state(self) -> np.ndarray:
         """Get the current state of the environment."""

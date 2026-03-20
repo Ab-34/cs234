@@ -1,283 +1,361 @@
-"""
-BC Pretraining + PPO Fine-tuning Pipeline
-
-Steps:
-1. Load expert demos from HDF5 robomimic dataset
-2. Pretrain SB3's ActorCriticPolicy with BC (MSE on actions)
-3. Initialize PPO with the BC-pretrained policy weights
-4. Fine-tune with PPO
-5. Evaluate and save results
-"""
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import os
 import argparse
 import matplotlib.pyplot as plt
 
-# import robosuite.utils.macros as macros
-# macros.SIMULATION_WARNINGS = False
-
-from robomimic.robomimic_env import (
+from robomimic.robomimic_env_copy import (
     RobomimicEnvWrapper,
     load_robomimic_trajectories,
-    evaluate_policy_robomimic
+    evaluate_policy_robomimic,
 )
+
+# from robomimic.robomimic_env_copy_fully_new import RobomimicEnvWrapper
+
 from visualize import visualize_trajectories_videos
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 
-
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Args
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dataset_path",  type=str, default="/home/yash/Stanford/CS234/project/cs234/low_dim_v15.hdf5",           help="Path to robomimic HDF5 dataset")
-parser.add_argument("--save_dir",      type=str, default="./",   help="Directory to save all outputs")
-parser.add_argument("--num_demos",     type=int, default=50,             help="Number of demos to load (None = all)")
 
-# BC args
-parser.add_argument("--bc_epochs",     type=int,   default=1000,            help="BC pretraining epochs")
-parser.add_argument("--bc_lr",         type=float, default=3e-4,           help="BC learning rate")
-parser.add_argument("--bc_batch_size", type=int,   default=256,            help="BC batch size")
+parser.add_argument("--dataset_path", type=str,
+default="/home/yash/Stanford/CS234/project/cs234/low_dim_v15.hdf5")
 
-# PPO args
-parser.add_argument("--ppo_timesteps", type=int,   default=500_000,        help="PPO fine-tuning timesteps")
-parser.add_argument("--n_steps",       type=int,   default=2048,           help="PPO n_steps per rollout")
+parser.add_argument("--save_dir", type=str, default="./")
+parser.add_argument("--num_demos", type=int, default=50)
 
-# Env args
-parser.add_argument("--horizon",       type=int,   default=500,            help="Episode horizon")
-parser.add_argument("--num_eval_eps",  type=int,   default=10,             help="Number of eval episodes")
-parser.add_argument("--full_loss",     action="store_true",                help="Use full dense reward")
+parser.add_argument("--load_warmup_model", type=str, default="/home/yash/Stanford/CS234/project/cs234/ppo_trained/bc_ppo_1_1000_no_cnn_reward_tushar_bcppo/500000_steps/ppo_bc_warmup.zip")
+
+# BC
+parser.add_argument("--bc_epochs", type=int, default=1000)
+parser.add_argument("--bc_lr", type=float, default=3e-4)
+parser.add_argument("--bc_batch_size", type=int, default=256)
+
+# Warmup
+parser.add_argument("--warmup_steps", type=int, default=50000)
+
+# PPO
+parser.add_argument("--ppo_timesteps", type=int, default=500000)
+parser.add_argument("--n_steps", type=int, default=60)
+parser.add_argument("--ppo_lr", type=float, default=2e-5)
+parser.add_argument("--clip_range", type=float, default=0.1)
+parser.add_argument("--n_epochs", type=int, default=1)
+parser.add_argument("--ent_coef", type=float, default=0.01)
+
+# BC regularization
+parser.add_argument("--lambda_bc", type=float, default=0.5)
+
+# Env
+parser.add_argument("--horizon", type=int, default=60)
+parser.add_argument("--num_eval_eps", type=int, default=10)
 
 args = parser.parse_args()
 
-os.makedirs(args.save_dir, exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
-
-print("\n[1/4] Creating environment...")
-env = RobomimicEnvWrapper(
-    env_name="Lift",
-    robots="Panda",
-    use_camera_obs=False,
-    render_mode="rgb_array",
-    has_renderer=False,
-    use_object_obs=True,
-    horizon=args.horizon,
-    full_loss=args.full_loss,
-)
-print(f"  Obs space:    {env.observation_space.shape}")
-print(f"  Action space: {env.action_space.shape}")
-
-
-# ---------------------------------------------------------------------------
-# Load expert demonstrations
-# ---------------------------------------------------------------------------
-
-print("\n[2/4] Loading expert demonstrations...")
-trajectories = load_robomimic_trajectories(
-    dataset_path=args.dataset_path,
-    num_trajectories=args.num_demos,
-    verbose=True,
-)
-
-# Flatten all trajectories into (N, obs_dim) and (N, action_dim)
-all_obs     = np.concatenate(trajectories["observations"], axis=0)  # (N, obs_dim)
-all_actions = np.concatenate(trajectories["actions"],      axis=0)  # (N, action_dim)
-
-print(f"  Total transitions: {len(all_obs)}")
-
-obs_tensor    = torch.tensor(all_obs,     dtype=torch.float32)
-action_tensor = torch.tensor(all_actions, dtype=torch.float32)
-
-dataset    = TensorDataset(obs_tensor, action_tensor)
-dataloader = DataLoader(dataset, batch_size=args.bc_batch_size, shuffle=True)
-
-
-# ---------------------------------------------------------------------------
-# BC Pretraining
-# ---------------------------------------------------------------------------
-
-print("\n[3/4] BC Pretraining...")
-
-# Build ActorCriticPolicy with the same spaces as the env
-bc_policy = ActorCriticPolicy(
-    observation_space=env.observation_space,
-    action_space=env.action_space,
-    lr_schedule=lambda _: args.bc_lr,
-)
-bc_policy.train()
-
-optimizer = optim.Adam(bc_policy.parameters(), lr=args.bc_lr)
-mse_loss  = nn.MSELoss()
-
-bc_losses = []
-
-for epoch in range(args.bc_epochs):
-    epoch_loss = 0.0
-    num_batches = 0
-
-    for obs_batch, action_batch in dataloader:
-        optimizer.zero_grad()
-
-        # ActorCriticPolicy.forward returns (actions, values, log_probs)
-        # We use _predict / get_distribution to get the action mean for MSE
-        # Using evaluate_actions gives us log_probs which we can use,
-        # but for BC we want to directly regress on the mean action.
-        # get_distribution gives us the distribution; we take its mean.
-        dist = bc_policy.get_distribution(obs_batch)
-        action_mean = dist.distribution.mean  # Gaussian mean
-
-        loss = mse_loss(action_mean, action_batch)
-        loss.backward()
-        optimizer.step()
-
-        epoch_loss  += loss.item()
-        num_batches += 1
-
-    avg_loss = epoch_loss / num_batches
-    bc_losses.append(avg_loss)
-
-    if (epoch + 1) % 10 == 0:
-        print(f"  Epoch [{epoch+1:>4}/{args.bc_epochs}]  BC Loss: {avg_loss:.6f}")
-
-# Save BC loss curve
-plt.figure(figsize=(8, 4))
-plt.plot(bc_losses)
-plt.xlabel("Epoch")
-plt.ylabel("MSE Loss")
-plt.title("BC Pretraining Loss")
-plt.tight_layout()
-loss_curve_path = os.path.join(args.save_dir, "bc_loss_curve.png")
-plt.savefig(loss_curve_path)
-plt.close()
-print(f"  BC loss curve saved to: {loss_curve_path}")
-
-# Save BC policy weights
-bc_weights_path = os.path.join(args.save_dir, "bc_policy.pth")
-torch.save(bc_policy.state_dict(), bc_weights_path)
-print(f"  BC weights saved to:    {bc_weights_path}")
-
-
-# ---------------------------------------------------------------------------
-# PPO Fine-tuning (initialized from BC weights)
-# ---------------------------------------------------------------------------
-
-print("\n[4/4] PPO Fine-tuning...")
-
-# Create PPO model — SB3 will build its own ActorCriticPolicy internally
-ppo_model = PPO(
-    policy="MlpPolicy",
-    env=env,
-    verbose=1,
-    n_steps=args.n_steps,
-    tensorboard_log=os.path.join(args.save_dir, "tensorboard"),
-    learning_rate=3e-4,
-    batch_size=64,
-    n_epochs=10,
-    gamma=0.99,
-    gae_lambda=0.95,
-    clip_range=0.2,
-    ent_coef=0.0,
-)
-
-# Transplant BC-pretrained weights into PPO's policy
-# Only load weights that match (policy network; value head stays random)
-bc_state    = bc_policy.state_dict()
-ppo_state   = ppo_model.policy.state_dict()
-
-matched = {k: v for k, v in bc_state.items() if k in ppo_state and ppo_state[k].shape == v.shape}
-ppo_state.update(matched)
-ppo_model.policy.load_state_dict(ppo_state)
-
-print(f"  Transferred {len(matched)}/{len(ppo_state)} parameter tensors from BC → PPO")
-
-# # Fine-tune with PPO
-
-
-
 
 save_dir = os.path.join(
-    "./ppo_trained/bc_ppo_1_1000_simple_reward",
-    f"{args.ppo_timesteps}_"
+    args.save_dir,
+    "ppo_trained/bc_ppo_4_try9_60_steps_mine_full_complex_old3_yes_grasp",
+    f"{args.ppo_timesteps}_steps",
 )
 
 os.makedirs(save_dir, exist_ok=True)
 
-checkpoint_callback = CheckpointCallback(
-    save_freq=5000,                 # save every 10k steps
-    save_path=save_dir,
-    name_prefix="ppo_model",
-    save_replay_buffer=False,
-    save_vecnormalize=False,
+
+# ------------------------------------------------------------
+# BC Regularization Callback
+# ------------------------------------------------------------
+
+class BCRegularizationCallback(BaseCallback):
+
+    def __init__(self, bc_policy, lambda_bc, total_timesteps):
+        super().__init__()
+        self.bc_policy = bc_policy
+        self.lambda_bc = lambda_bc
+        self.total_timesteps = total_timesteps
+        self.steps = 0
+
+    def _on_rollout_start(self):
+
+        if self.bc_policy is None:
+            return
+
+        self.steps += self.model.n_steps
+
+        progress = self.steps / self.total_timesteps
+        weight = self.lambda_bc * (1 - progress)
+
+        if weight <= 0:
+            return
+
+        batch = list(self.model.rollout_buffer.get(256))[0]
+        obs = batch.observations
+
+        with torch.no_grad():
+            bc_mean = self.bc_policy.get_distribution(obs).distribution.mean
+
+        ppo_mean = self.model.policy.get_distribution(obs).distribution.mean
+
+        loss = weight * F.mse_loss(ppo_mean, bc_mean)
+
+        self.model.policy.optimizer.zero_grad()
+        loss.backward()
+        self.model.policy.optimizer.step()
+
+
+# ------------------------------------------------------------
+# ENVIRONMENT
+# ------------------------------------------------------------
+
+print("\nCreating environment...")
+
+def make_env():
+    return RobomimicEnvWrapper(
+        env_name="Lift",
+        robots="Panda",
+        use_camera_obs=False,
+        has_renderer=False,
+        horizon=args.horizon,
+    )
+
+env = DummyVecEnv([make_env])
+env = VecNormalize(env, norm_obs=True, norm_reward=False)
+
+
+# ------------------------------------------------------------
+# LOAD DATA
+# ------------------------------------------------------------
+
+print("\nLoading demonstrations...")
+
+trajectories = load_robomimic_trajectories(
+    dataset_path=args.dataset_path,
+    num_trajectories=args.num_demos,
 )
 
-# # model.learn(total_timesteps=args.timestep, progress_bar=True)
-# model.learn(
-#     total_timesteps=args.timestep,
-#     progress_bar=True,
-#     callback=checkpoint_callback
-# )
+all_obs = np.concatenate(trajectories["observations"], axis=0)
+all_actions = np.concatenate(trajectories["actions"], axis=0)
+
+all_obs = env.normalize_obs(all_obs)
+
+dataset = TensorDataset(
+    torch.tensor(all_obs, dtype=torch.float32),
+    torch.tensor(all_actions, dtype=torch.float32),
+)
+
+dataloader = DataLoader(dataset, batch_size=args.bc_batch_size, shuffle=True)
+
+
+# ------------------------------------------------------------
+# BC PRETRAINING
+# ------------------------------------------------------------
+
+bc_policy = None
+
+if args.load_warmup_model is None:
+
+    print("\nRunning BC pretraining...")
+
+    bc_policy = ActorCriticPolicy(
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        lr_schedule=lambda _: args.bc_lr,
+    )
+
+    optimizer = optim.Adam(bc_policy.parameters(), lr=args.bc_lr)
+    mse = nn.MSELoss()
+
+    for epoch in range(args.bc_epochs):
+
+        total_loss = 0
+
+        for obs, act in dataloader:
+
+            optimizer.zero_grad()
+
+            dist = bc_policy.get_distribution(obs)
+            mean = dist.distribution.mean
+
+            loss = mse(mean, act)
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        if epoch % 10 == 0:
+            print("BC epoch", epoch, total_loss)
+
+
+# ------------------------------------------------------------
+# PPO SETUP
+# ------------------------------------------------------------
+
+if args.load_warmup_model:
+
+    print("\nLoading warmup PPO model...")
+
+    ppo_model = PPO.load(
+        args.load_warmup_model,
+        env=env,
+        device="auto",
+        n_steps=args.n_steps
+    )
+
+else:
+
+    print("\nCreating PPO model...")
+
+    ppo_model = PPO(
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=args.ppo_lr,
+        n_steps=args.n_steps,
+        batch_size=16,
+        n_epochs=args.n_epochs,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=args.clip_range,
+        ent_coef=0.0,
+        verbose=1,
+    )
+
+    # --------------------------------
+    # Transfer BC weights
+    # --------------------------------
+
+    bc_state = bc_policy.state_dict()
+    ppo_state = ppo_model.policy.state_dict()
+
+    matched = {
+        k: v for k, v in bc_state.items()
+        if k in ppo_state and ppo_state[k].shape == v.shape
+    }
+
+    ppo_state.update(matched)
+
+    ppo_model.policy.load_state_dict(ppo_state)
+
+    bc_policy = bc_policy.to(ppo_model.device)
+
+
+    # --------------------------------
+    # VALUE WARMUP
+    # --------------------------------
+
+    print("\nValue head warmup...")
+
+    for name, param in ppo_model.policy.named_parameters():
+
+        if "value" not in name:
+            param.requires_grad = False
+
+    ppo_model.learn(
+        total_timesteps=args.warmup_steps,
+        progress_bar=True,
+        reset_num_timesteps=True,
+    )
+
+    for param in ppo_model.policy.parameters():
+        param.requires_grad = True
+
+    ppo_model.policy.optimizer = optim.Adam(
+        ppo_model.policy.parameters(),
+        lr=args.ppo_lr
+    )
+
+    warmup_path = os.path.join(save_dir, "ppo_bc_warmup")
+
+    ppo_model.save(warmup_path)
+
+    print("Warmup model saved:", warmup_path)
+
+
+# ------------------------------------------------------------
+# PPO TRAINING
+# ------------------------------------------------------------
+
+print("\nRunning PPO training...")
+
+checkpoint_callback = CheckpointCallback(
+    save_freq=100,
+    save_path=save_dir,
+    name_prefix="ppo_model"
+)
+
+bc_callback = None
+
+if bc_policy is not None:
+
+    bc_callback = BCRegularizationCallback(
+        bc_policy,
+        args.lambda_bc,
+        args.ppo_timesteps
+    )
+
+callbacks = [checkpoint_callback]
+
+if bc_callback:
+    callbacks.append(bc_callback)
 
 ppo_model.learn(
     total_timesteps=args.ppo_timesteps,
+    callback=callbacks,
     progress_bar=True,
-    tb_log_name="ppo_bc_init",
-    callback=checkpoint_callback
+    reset_num_timesteps=False,
 )
 
-ppo_save_path = os.path.join(args.save_dir, "ppo_model")
-ppo_model.save(ppo_save_path)
-print(f"  PPO model saved to: {ppo_save_path}.zip")
+ppo_model.save(os.path.join(save_dir, "ppo_final"))
+
+env.save(os.path.join(save_dir, "vecnormalize.pkl"))
 
 
-# # ---------------------------------------------------------------------------
-# # Evaluation
-# # ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# EVALUATION
+# ------------------------------------------------------------
 
-# print("\nEvaluating final policy...")
+print("\nEvaluating policy...")
 
-class SB3Agent:
+class Agent:
+
     def __init__(self, model):
         self.model = model
 
-    def get_action(self, obs: np.ndarray, deterministic: bool = True):
-        action, _ = self.model.predict(obs, deterministic=deterministic)
+    def get_action(self, obs, deterministic=True):
+        action, _ = self.model.predict(obs, deterministic)
         return action
 
-agent = SB3Agent(ppo_model)
+
+agent = Agent(ppo_model)
 
 results = evaluate_policy_robomimic(
-    env, agent,
+    env,
+    agent,
     num_episodes=args.num_eval_eps,
-    deterministic=True,
-    verbose=True,
-    visualize=True,
 )
 
-# # Save eval videos
-video_dir = os.path.join(args.save_dir, "videos")
-visualize_trajectories_videos(results["episodes"], out_dir=video_dir)
-print(f"  Videos saved to: {video_dir}")
+print("Success rate:", results["success_rate"])
 
-# # Save metrics
-# metrics_path = os.path.join(args.save_dir, "final_metrics.txt")
-# with open(metrics_path, "w") as f:
-#     f.write(f"Success rate:   {results['success_rate']:.2%}\n")
-#     f.write(f"Average reward: {results['avg_reward']:.4f}\n")
-#     f.write(f"Average steps:  {results['avg_steps']:.1f}\n")
-# print(f"  Metrics saved to: {metrics_path}")
+video_dir = os.path.join(save_dir, "videos")
 
-# env.close()
-# print("\nDone.")
+visualize_trajectories_videos(
+    results["episodes"],
+    out_dir=video_dir
+)
+
+print("Videos saved:", video_dir)
+
+env.close()
+
+print("\nDone.")
