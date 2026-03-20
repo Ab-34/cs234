@@ -63,7 +63,7 @@ python src/bc_evaluate.py \
 ```
 
 ### `src/train_cnn.py` Train CNN Reward Model
-Fine-tunes an [R3M](https://github.com/facebookresearch/r3m) (ResNet-50) backbone with a regression head to predict task-progress scores (0–100) from frames, using `frame_scores.json` as supervision.
+Fine-tunes an [R3M](https://github.com/facebookresearch/r3m) (ResNet-50) backbone with a regression head to predict task-progress scores (-100 – 100) from frames, using `frame_scores.json` as supervision.
 
 ```bash
 pip install r3m
