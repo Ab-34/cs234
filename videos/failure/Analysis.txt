@@ -1,0 +1,15 @@
+REWARD HACKING:
+
+- The agent learns that simply tilting the cube raises the height of its center and treats that as a success
+- Corrected by introducing a dense and continuous reward for lifting higher
+- In another video, the agent learnt to simply align itself with the cube at a height above it and close its grippers fully to maximise grasping reward
+
+OCCLUSIONS:
+
+- VLM based rewards do not work when the block is occluded
+- Also leads to alignment issues
+
+GRASPS BUT DOES NOT LIFT:
+
+- The reward continuity after grasping needs to guide the agent towards exploring lifting
+- Densifying the lifting process and pre training with BC solves this

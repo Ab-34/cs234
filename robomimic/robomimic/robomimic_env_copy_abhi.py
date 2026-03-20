@@ -13,6 +13,21 @@ import h5py
 from robosuite import load_composite_controller_config
 
 
+
+import json
+import random
+import os
+
+import torch
+from torchvision import transforms
+from PIL import Image
+import matplotlib.pyplot as plt
+import sys
+# Add the directory containing train_cnn.py
+sys.path.append('/home/yash/Stanford/CS234/project/cs234/robomimic/robomimic/')  # absolute path to folder
+from train_cnn import load_reward_model, predict_score
+
+
 class RobomimicEnvWrapper(gym.Env):
     """
     Gymnasium-compatible wrapper for robomimic/robosuite environments.
@@ -60,6 +75,10 @@ class RobomimicEnvWrapper(gym.Env):
         self.robots = robots
         self.render_mode = render_mode
         self.horizon = horizon
+
+
+        print("Loading reward model...")
+        self.reward_model = load_reward_model()
         
         # Create robosuite environment with default controller settings
         # This matches the configuration used to collect the robomimic datasets
@@ -155,10 +174,27 @@ class RobomimicEnvWrapper(gym.Env):
         # print("Cube height loss:", (5.0 * (cube_height-self.table_height)))
         weight = 1
         if self.full_loss and True:
-            dense_reward = (weight * r_reach_distance) + (10*weight * (cube_height-self.table_height))
+            dense_reward = (weight * r_reach_distance) + (100*weight * (cube_height-self.table_height))
         else:
-            dense_reward = (weight * r_reach_distance) + (10*weight * (cube_height-self.table_height))
-        
+            dense_reward = (weight * r_reach_distance) + (100*weight * (cube_height-self.table_height))
+
+
+        # # CNN-based reward from reward model
+        try:
+            frame = self.env.sim.render(width=224, height=224, camera_name="agentview")[::-1]
+            img = Image.fromarray(frame.astype(np.uint8))
+            tf = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+            ])
+            device = next(self.reward_model.parameters()).device
+            x = tf(img).unsqueeze(0).to(device)
+            with torch.no_grad():
+                cnn_reward = self.reward_model(x).item() * 100
+            dense_reward += cnn_reward
+        except Exception:
+            pass
+
         return float(dense_reward)
 
     def get_state(self) -> np.ndarray:
@@ -274,7 +310,7 @@ class RobomimicEnvWrapper(gym.Env):
         # Check if task succeeded
         success = reward == 1
 
-        reward =  self.compute_dense_reward_from_info(obs_dict)       
+        reward =  self.compute_dense_reward_from_info(obs_dict) + 1000*success  
         terminated = success  # Task completed successfully
         truncated = done and not success  # Episode ended without success
         

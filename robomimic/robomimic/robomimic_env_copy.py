@@ -121,7 +121,7 @@ class RobomimicEnvWrapper(gym.Env):
         print("FULL LOSS:", self.full_loss)
 
 
-    def compute_dense_reward_from_info_not_so_good(self, info: dict) -> float:
+    def compute_dense_reward_from_info_2(self, info: dict) -> float:
         """
         Dense reward encouraging:
         1. Center gripper over cube (XY alignment)
@@ -129,6 +129,7 @@ class RobomimicEnvWrapper(gym.Env):
         3. Align gripper pointing downward
         4. Close gripper ONLY when centered
         5. Lift cube AFTER proper grasp
+        # FULL REWARD FUNCTION OLDER ONE
         """
 
         if "robot0_eef_pos" not in info:
@@ -556,7 +557,7 @@ class RobomimicEnvWrapper(gym.Env):
 
         return float(reward)
 
-    def compute_dense_reward_from_info_maybe_working_doesnt_give_good_Results(self, info: dict) -> float:
+    def compute_dense_reward_from_info(self, info: dict) -> float:
         """
         Staged reward function with gating:
         Phase 1 — Move EEF above cube (XY + Z hover)
@@ -571,6 +572,7 @@ class RobomimicEnvWrapper(gym.Env):
         # compute_dense_reward_from_info_to_test_later
         # compute_dense_reward_from_info_maybe_working_doesnt_give_good_Results
 
+        #3
         """
         if "robot0_eef_pos" not in info:
             return 0.0
@@ -681,7 +683,7 @@ class RobomimicEnvWrapper(gym.Env):
             1.0  * r_z         +   # guide Z hover
             10.0  * r_orient    +   # orientation always encouraged
             6.0  * r_grasp     +   # grasp gated by approach quality
-            50.0 * r_lift          # lift is the main task signal
+            5000.0 * r_lift          # lift is the main task signal
         )
 
         return float(reward)
@@ -841,7 +843,218 @@ class RobomimicEnvWrapper(gym.Env):
         return float(reward)
         
     
-    def compute_dense_reward_from_info(self, info: dict) -> float:
+    def compute_dense_reward_from_info_11(self, info: dict) -> float:
+        """
+        Staged curriculum reward for pick-and-place.
+
+        Core fix vs prior version:
+        The robot was learning to close its gripper immediately and ram the block.
+        Root cause: r_grasp = gripper_norm * r_proximity rewarded closing at ANY
+        time the robot was near the cube, even while approaching.
+
+        Solution (three-part fix):
+        1. Reward open-gripper approach: robot is explicitly incentivised to arrive
+            above the cube with the gripper OPEN.
+        2. Steep approach gate on grasping: closing only pays off when approach_score
+            is already high (approach_score ** 3 makes the gate very sharp).
+        3. Premature-close penalty: explicit negative reward for closing the gripper
+            while the approach quality is still low — directly discourages ramming.
+
+
+        #key = 11
+        #FULL COMPLEX REWARD WITH EVERYTHING:
+
+        """
+        try:
+            # ── Input validation ──────────────────────────────────────────────────
+            if "robot0_eef_pos" not in info:
+                return 0.0
+
+            eef_pos = np.asarray(info["robot0_eef_pos"], dtype=np.float64).ravel()
+            if eef_pos.shape[0] < 3 or not np.all(np.isfinite(eef_pos)):
+                return 0.0
+
+            cube_raw = info.get("cube_pos", info.get("object", None))
+            if cube_raw is None:
+                return 0.0
+            cube_pos = np.asarray(cube_raw, dtype=np.float64).ravel()
+            if cube_pos.shape[0] < 3 or not np.all(np.isfinite(cube_pos)):
+                return 0.0
+
+            # ── Phase 1 — XY Alignment ────────────────────────────────────────────
+            xy_dist = float(np.linalg.norm(eef_pos[:2] - cube_pos[:2]))
+            r_xy    = float(np.exp(-8.0 * xy_dist))
+
+            # ── Phase 2 — Z Hover ─────────────────────────────────────────────────
+            HOVER_HEIGHT = 0.03                          # 3 cm above cube centre
+            z_target     = float(cube_pos[2]) + HOVER_HEIGHT
+            z_error      = abs(float(eef_pos[2]) - z_target)
+            r_z          = float(np.exp(-12.0 * z_error))
+
+            # Combined approach quality (0..1); used as the gating signal below
+            approach_score = r_xy * r_z
+
+            # ── Phase 3 — Orientation ─────────────────────────────────────────────
+            r_orient   = 0.0
+            r_vertical = 0.0
+            r_roll     = 0.0
+
+            if "robot0_eef_quat" in info:
+                try:
+                    quat = np.asarray(info["robot0_eef_quat"], dtype=np.float64).ravel()
+                    if quat.shape[0] == 4 and np.all(np.isfinite(quat)):
+                        q_norm = float(np.linalg.norm(quat))
+                        if q_norm < 1e-6:
+                            raise ValueError("zero quaternion")
+                        qx, qy, qz, qw = quat / q_norm
+
+                        eef_z = np.array([
+                            2.0 * (qx * qz + qy * qw),
+                            2.0 * (qy * qz - qx * qw),
+                            1.0 - 2.0 * (qx ** 2 + qy ** 2),
+                        ])
+                        eef_z /= max(float(np.linalg.norm(eef_z)), 1e-6)
+                        dot_z       = float(np.clip(np.dot(eef_z, [0.0, 0.0, -1.0]), -1.0, 1.0))
+                        r_vertical  = float(np.exp(-5.0 * np.arccos(dot_z)))
+
+                        eef_x = np.array([
+                            1.0 - 2.0 * (qy ** 2 + qz ** 2),
+                            2.0 * (qx * qy + qz * qw),
+                            2.0 * (qx * qz - qy * qw),
+                        ])
+                        eef_x /= max(float(np.linalg.norm(eef_x)), 1e-6)
+
+                        block_x = np.array([1.0, 0.0, 0.0])
+                        if "cube_quat" in info:
+                            try:
+                                bq = np.asarray(info["cube_quat"], dtype=np.float64).ravel()
+                                if bq.shape[0] == 4 and np.all(np.isfinite(bq)):
+                                    bn = float(np.linalg.norm(bq))
+                                    if bn > 1e-6:
+                                        bx, by, bz, bw = bq / bn
+                                        cand = np.array([
+                                            1.0 - 2.0 * (by ** 2 + bz ** 2),
+                                            2.0 * (bx * by + bz * bw),
+                                            2.0 * (bx * bz - by * bw),
+                                        ])
+                                        cn = float(np.linalg.norm(cand))
+                                        if cn > 1e-6:
+                                            block_x = cand / cn
+                            except Exception:
+                                pass
+
+                        dot_roll = float(np.clip(abs(np.dot(eef_x, block_x)), 0.0, 1.0))
+                        r_roll   = float(np.exp(-5.0 * np.arccos(dot_roll)))
+
+                        r_orient = r_vertical * r_roll
+
+                except Exception:
+                    r_orient = 0.0
+
+            # ── Phase 4 — Gripper (open-approach + gated close) ───────────────────
+            r_approach_open    = 0.0   # reward arriving open — the key anti-ramming term
+            r_grasp            = 0.0   # reward closing when well positioned
+            r_premature_close  = 0.0   # penalty for closing while not yet positioned
+            gripper_norm       = 0.0
+
+            if "robot0_gripper_qpos" in info:
+                try:
+                    gqpos = np.asarray(info["robot0_gripper_qpos"], dtype=np.float64).ravel()
+                    if gqpos.size > 0 and np.all(np.isfinite(gqpos)):
+                        g = float(np.abs(gqpos).mean())
+
+                        OPEN_VAL  = 0.04
+                        CLOSE_VAL = 0.00
+                        denom     = abs(OPEN_VAL - CLOSE_VAL) + 1e-6
+                        gripper_norm = float(np.clip((OPEN_VAL - g) / denom, 0.0, 1.0))
+                        gripper_open = 1.0 - gripper_norm        # 1 = fully open
+
+                        # ── Term A: Open-gripper approach ─────────────────────────
+                        # Rewards the robot for being above the cube WITH the gripper
+                        # open. This creates a strong curriculum: first learn to
+                        # navigate to the hover position while staying open.
+                        # approach_score is high only when BOTH r_xy and r_z are good.
+                        r_approach_open = approach_score * gripper_open
+
+                        # ── Term B: Gated grasp reward ────────────────────────────
+                        # approach_score ** 3 creates a very steep gate:
+                        #   score=0.5  → gate=0.125  (almost no reward for closing)
+                        #   score=0.8  → gate=0.512  (moderate reward)
+                        #   score=0.95 → gate=0.857  (strong reward — robot is ready)
+                        # This means the robot must FULLY solve approach before closing
+                        # pays off more than the open-approach reward above.
+                        approach_gate   = approach_score ** 3
+                        orient_bonus    = 0.4 + 0.6 * r_orient   # 0.4..1.0 multiplier
+                        r_grasp         = approach_gate * gripper_norm * orient_bonus
+                        r_grasp         = float(np.clip(r_grasp, 0.0, 1.0))
+
+                        # ── Term C: Premature-close penalty ───────────────────────
+                        # When approach_score is low but gripper is closing, penalise.
+                        # (1 - approach_score) is high when far/misaligned.
+                        # gripper_norm is high when closing.
+                        # The product gives max penalty exactly when ramming occurs.
+                        bad_close_score    = (1.0 - approach_score) * gripper_norm
+                        r_premature_close  = float(np.clip(bad_close_score, 0.0, 1.0))
+
+                except Exception:
+                    gripper_norm      = 0.0
+                    r_grasp           = 0.0
+                    r_approach_open   = 0.0
+                    r_premature_close = 0.0
+
+            # ── Phase 5 — Lift ────────────────────────────────────────────────────
+            r_lift = 0.0
+            try:
+                if self.table_height is None:
+                    self.table_height = float(cube_pos[2])
+
+                height_above_table = max(0.0, float(cube_pos[2]) - float(self.table_height))
+
+                # Gate: robot must be gripping AND centred XY to earn lift reward.
+                # Orientation is excluded from the gate — once grasped, adding
+                # orientation as a gate would block the lift signal entirely.
+                grasp_gate    = float(np.clip(gripper_norm * r_xy, 0.0, 1.0))
+
+                # Smooth continuous height reward (active from the very first mm)
+                r_lift_shaped = float(np.tanh(15.0 * height_above_table))
+                r_lift        = grasp_gate * r_lift_shaped
+
+                # Progressive plateau bonuses, always scaled by grasp_gate
+                if height_above_table > 0.02:
+                    r_lift += 0.5 * grasp_gate
+                if height_above_table > 0.05:
+                    r_lift += 1.0 * grasp_gate
+
+            except Exception:
+                r_lift = 0.0
+
+            # ── Weighted combination ──────────────────────────────────────────────
+            #
+            # Weight rationale:
+            #   r_xy / r_z          low-moderate: always guide position, don't dominate
+            #   r_orient            moderate: always useful but position matters more
+            #   r_approach_open     KEY NEW TERM: teaches "arrive open" curriculum
+            #   r_premature_close   NEGATIVE: directly punishes ramming behaviour
+            #   r_grasp             strong: only earns out when truly positioned
+            #   r_lift              dominant: the actual task objective
+            #
+            reward = (
+                3.0  * r_xy             +
+                2.0  * r_z              +
+                10.0  * r_orient         +
+                10.0  * r_approach_open  +   # ← NEW: incentivise arriving open
+            -10.0  * r_premature_close+   # ← NEW: punish ramming/premature close
+                10.0 * r_grasp          +
+                50000.0 * r_lift
+            )
+
+            return reward
+
+        except Exception:
+            return 0.0
+        
+
+    def compute_dense_reward_from_info_basically_just_height(self, info: dict) -> float:
         """
         Staged curriculum reward for pick-and-place.
 
@@ -1032,12 +1245,12 @@ class RobomimicEnvWrapper(gym.Env):
             #   r_lift              dominant: the actual task objective
             #
             reward = (
-                2.0  * r_xy             +
-                1.0  * r_z              +
-                2.0  * r_orient         +
-                5.0  * r_approach_open  +   # ← NEW: incentivise arriving open
-            -8.0  * r_premature_close+   # ← NEW: punish ramming/premature close
-                10.0 * r_grasp          +
+                0.0  * r_xy             +
+                0.0  * r_z              +
+                0.0  * r_orient         +
+                0.0  * r_approach_open  +   # ← NEW: incentivise arriving open
+            -0.0  * r_premature_close+   # ← NEW: punish ramming/premature close
+                0.0 * r_grasp          +
                 50.0 * r_lift
             )
 
@@ -1156,7 +1369,7 @@ class RobomimicEnvWrapper(gym.Env):
         # Check if task succeeded
         success = reward == 1
 
-        reward =  self.compute_dense_reward_from_info(obs_dict)   #co
+        reward =  self.compute_dense_reward_from_info(obs_dict) + success*50000  #co
             
         terminated = success  # Task completed successfully
         truncated = done and not success  # Episode ended without success

@@ -6,7 +6,7 @@ import argparse
 import robosuite.utils as macros
 macros.SIMULATION_WARNINGS = False
 
-from robomimic.robomimic_env_copy import (
+from robomimic.robomimic_env_copy_abhi import (
     RobomimicEnvWrapper,
     evaluate_policy_robomimic
 )
@@ -16,15 +16,17 @@ import visualize_yash
 from stable_baselines3 import PPO
 
 
+# GOOD EVALUATE
+
 # =========================
 # ARGPARSE
 # =========================
 parser = argparse.ArgumentParser()
 parser.add_argument("--policy", type=str, default="MlpPolicy")
 i = 12
-parser.add_argument("--model_path", type=str, default="/home/yash/Stanford/CS234/project/cs234/ppo_trained/rewards_new_lift_with_gripper_4_height_001_big_model/MlpPolicy_500000_False/ppo_model_340000_steps.zip")
+parser.add_argument("--model_path", type=str, default="/home/yash/Stanford/CS234/project/cs234/ppo_trained/bc_ppo_4_try1/500000_steps/ppo_model_52000_steps.zip")
 parser.add_argument("--full_loss", action="store_true")
-parser.add_argument("--episodes", type=int, default=5)
+parser.add_argument("--episodes", type=int, default=100)
 parser.add_argument("--bc_lr",         type=float, default=3e-4,           help="BC learning rate")
 
 args = parser.parse_args()
@@ -38,7 +40,7 @@ env = RobomimicEnvWrapper(
     robots="Panda",
     use_camera_obs=False,
     render_mode="rgb_array",
-    has_renderer=True,
+    has_renderer=False,
     use_object_obs=True,
     full_loss=args.full_loss
 )
@@ -102,12 +104,12 @@ results = evaluate_policy_robomimic(
     num_episodes=args.episodes,
     deterministic=True,
     verbose=True,
-    visualize=True   # <-- This shows rendering
+    visualize=False   # <-- This shows rendering
 )
 
 
 
-visualize_yash.visualize_trajectories_videos(results['episodes'], out_dir=f"/home/yash/Stanford/CS234/project/cs234/visualized_videos/_ckpt_{i}")
+# visualize_yash.visualize_trajectories_videos(results['episodes'], out_dir=f"/home/yash/Stanford/CS234/project/cs234/visualized_videos/_ckpt_{i}")
 
 print("\n========== FINAL RESULTS ==========")
 print("Success rate:", results["success_rate"])

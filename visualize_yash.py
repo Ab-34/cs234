@@ -43,12 +43,12 @@ def plot_training_curves(history):
 
 def visualize_trajectories_videos(trajectories, out_dir="videos"):
     os.makedirs(out_dir, exist_ok=True)
-    sample=min(len(trajectories), 5)
-    print(trajectories)
+    sample=min(len(trajectories), 8)
+    # print(trajectories)
     for i, traj in enumerate(random.sample(trajectories, sample) ):
         
         video = np.stack(traj['images'], axis=0)  # shape: (T, H, W, C)
-        print(len(video))
+        # print(len(video))
         video_path = os.path.join(out_dir, f"trajectory_{i:03d}.mp4")
 
         # Save as mp4 video using imageio
